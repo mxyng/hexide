@@ -223,8 +223,8 @@ impl Hexide {
             let vertical_scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .symbols(symbols::scrollbar::VERTICAL)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓"));
+                .begin_symbol(None)
+                .end_symbol(None);
 
             let mut scrollbar_state = ScrollbarState::default()
                 .content_length(total_rows - visible_rows)
@@ -264,7 +264,7 @@ impl Hexide {
             .split(help_layout[1]);
 
         let help_text = match &self.mode {
-            Mode::Normal => " j/k/h/l: Move | PgUp/PgDn: Page | Home/End: Top/Bottom | q: Quit ",
+            Mode::Normal => " j/k: ↑/↓ | h/l: ←/→ | q: Quit ",
             Mode::Command(cmd) => &format!(" Offset: {} ", cmd),
         };
 
