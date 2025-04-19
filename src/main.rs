@@ -112,27 +112,17 @@ impl Hexide {
                         match self.mode {
                             Mode::Normal => match key.code {
                                 KeyCode::Char('q') => return Ok(()),
-                                KeyCode::Down => {
+                                KeyCode::Down | KeyCode::Char('j') => {
                                     // Move highlight down
                                     let max_line = self.total_rows().saturating_sub(1);
                                     self.highlighted_line =
                                         self.highlighted_line.saturating_add(1).min(max_line);
                                     self.ensure_highlighted_visible(visible_rows);
                                 }
-                                KeyCode::Up => {
+                                KeyCode::Up | KeyCode::Char('k') => {
                                     // Move highlight up
                                     self.highlighted_line = self.highlighted_line.saturating_sub(1);
                                     self.ensure_highlighted_visible(visible_rows);
-                                }
-                                KeyCode::Char('j') => {
-                                    // Scroll down without moving highlight
-                                    let max_scroll = self.max_vertical_scroll(visible_rows);
-                                    self.vertical_scroll =
-                                        self.vertical_scroll.saturating_add(1).min(max_scroll);
-                                }
-                                KeyCode::Char('k') => {
-                                    // Scroll up without moving highlight
-                                    self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
                                 }
                                 KeyCode::Right | KeyCode::Char('l') => {
                                     let content_width = self.content_width();
@@ -321,7 +311,8 @@ impl Hexide {
 
         match self.mode {
             Mode::Normal => {
-                let help_text = " ↑/↓: Move highlight | j/k: Scroll | PgUp/PgDn: Page | Home/End: Jump | q: Quit ";
+                let help_text =
+                    " j/k/h/l: Move | PgUp/PgDn: Page | Home/End: Top/Bottom | q: Quit ";
                 let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
                     .style(Style::default().fg(Color::Gray));
                 f.render_widget(help_paragraph, help_layout[1]);
