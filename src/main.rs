@@ -18,29 +18,6 @@ use ratatui::{
     },
 };
 
-// Converts a path to a short representation, replacing the home directory with ~
-pub fn get_short_path<P: AsRef<Path>>(path: P) -> String {
-    let path = path.as_ref();
-
-    // Get the home directory
-    if let Ok(home) = env::var("HOME") {
-        let home_path = Path::new(&home);
-
-        // Check if the path starts with the home directory
-        if let Some(path_str) = path.to_str() {
-            if let Some(home_str) = home_path.to_str() {
-                if path_str.starts_with(home_str) {
-                    // Replace home directory with ~
-                    return format!("~{}", &path_str[home_str.len()..]);
-                }
-            }
-        }
-    }
-
-    // If we can't replace with ~, return the path as is
-    path.to_string_lossy().into_owned()
-}
-
 enum Mode {
     Normal,
     Command(String),
@@ -67,7 +44,7 @@ impl Hexide {
             file_data,
             vertical_scroll: 0,
             horizontal_scroll: 0,
-            filename: get_short_path(path),
+            filename: filename.to_string(),
             mode: Mode::Normal,
             highlighted_line: 0, // Start with the first line highlighted
         })
@@ -242,6 +219,31 @@ impl Hexide {
         }
     }
 
+    fn substitute_home(&self) -> String {
+        if let Ok(home) = env::var("HOME") {
+            if self.filename.starts_with(&home) {
+                return self.filename.replacen(&home, "~", 1);
+            }
+        }
+        self.filename.clone()
+    }
+
+    fn truncate_path(&self, width: usize) -> String {
+        self.substitute_home()
+            .split('/')
+            .last()
+            .unwrap_or(&self.filename)
+            .to_string()
+            .chars()
+            .take(width)
+            .collect::<String>()
+    }
+
+    fn title(&self, width: usize) -> String {
+        let max_width = width - " hexide -  ".len();
+        format!(" hexide - {} ", self.truncate_path(max_width))
+    }
+
     fn ui(&self, f: &mut Frame) {
         let area = f.area();
 
@@ -253,7 +255,7 @@ impl Hexide {
 
         // Create a block with rounded borders
         let block = Block::default()
-            .title(format!(" hexide - {} ", self.filename))
+            .title(self.title((area.width as usize) - 2))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
 
