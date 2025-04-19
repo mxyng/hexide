@@ -52,6 +52,7 @@ struct Hexide {
     horizontal_scroll: usize,
     filename: String,
     mode: Mode,
+    highlighted_line: usize, // New field to track highlighted line
 }
 
 impl Hexide {
@@ -68,6 +69,7 @@ impl Hexide {
             horizontal_scroll: 0,
             filename: get_short_path(path),
             mode: Mode::Normal,
+            highlighted_line: 0, // Start with the first line highlighted
         })
     }
 
@@ -96,6 +98,22 @@ impl Hexide {
         }
     }
 
+    // Ensure highlighted line is visible by adjusting scroll if needed
+    fn ensure_highlighted_visible(&mut self, visible_rows: usize) {
+        // If highlighted line is before visible area, scroll up
+        if self.highlighted_line < self.vertical_scroll {
+            self.vertical_scroll = self.highlighted_line;
+        }
+        // If highlighted line is after visible area, scroll down
+        else if self.highlighted_line >= self.vertical_scroll + visible_rows {
+            self.vertical_scroll = self.highlighted_line.saturating_sub(visible_rows) + 1;
+        }
+
+        // Make sure we don't scroll past the end
+        let max_scroll = self.max_vertical_scroll(visible_rows);
+        self.vertical_scroll = self.vertical_scroll.min(max_scroll);
+    }
+
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(250);
@@ -118,14 +136,28 @@ impl Hexide {
                             Mode::Normal => match key.code {
                                 KeyCode::Char('q') => return Ok(()),
                                 KeyCode::Down => {
+                                    // Move highlight down
+                                    let max_line = self.total_rows().saturating_sub(1);
+                                    self.highlighted_line =
+                                        self.highlighted_line.saturating_add(1).min(max_line);
+                                    self.ensure_highlighted_visible(visible_rows);
+                                }
+                                KeyCode::Up => {
+                                    // Move highlight up
+                                    self.highlighted_line = self.highlighted_line.saturating_sub(1);
+                                    self.ensure_highlighted_visible(visible_rows);
+                                }
+                                KeyCode::Char('j') => {
+                                    // Scroll down without moving highlight
                                     let max_scroll = self.max_vertical_scroll(visible_rows);
                                     self.vertical_scroll =
                                         self.vertical_scroll.saturating_add(1).min(max_scroll);
                                 }
-                                KeyCode::Up => {
+                                KeyCode::Char('k') => {
+                                    // Scroll up without moving highlight
                                     self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
                                 }
-                                KeyCode::Right => {
+                                KeyCode::Right | KeyCode::Char('l') => {
                                     let content_width = self.content_width();
 
                                     // Only scroll if content is wider than visible area
@@ -138,28 +170,33 @@ impl Hexide {
                                             .min(max_scroll);
                                     }
                                 }
-                                KeyCode::Left => {
+                                KeyCode::Left | KeyCode::Char('h') => {
                                     self.horizontal_scroll =
                                         self.horizontal_scroll.saturating_sub(1);
                                 }
                                 KeyCode::PageDown => {
-                                    let max_scroll = self.max_vertical_scroll(visible_rows);
-                                    self.vertical_scroll = self
-                                        .vertical_scroll
+                                    // Move highlight down by a page
+                                    let max_line = self.total_rows().saturating_sub(1);
+                                    self.highlighted_line = self
+                                        .highlighted_line
                                         .saturating_add(visible_rows)
-                                        .min(max_scroll);
+                                        .min(max_line);
+                                    self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::PageUp => {
-                                    let page_size =
-                                        terminal.size()?.height.saturating_sub(4) as usize;
-                                    self.vertical_scroll =
-                                        self.vertical_scroll.saturating_sub(page_size);
+                                    // Move highlight up by a page
+                                    let page_size = visible_rows;
+                                    self.highlighted_line =
+                                        self.highlighted_line.saturating_sub(page_size);
+                                    self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::Home => {
+                                    self.highlighted_line = 0;
                                     self.vertical_scroll = 0;
                                     self.horizontal_scroll = 0;
                                 }
                                 KeyCode::End => {
+                                    self.highlighted_line = self.total_rows().saturating_sub(1);
                                     self.vertical_scroll = self.max_vertical_scroll(visible_rows);
                                 }
                                 KeyCode::Char(':') => {
@@ -177,8 +214,9 @@ impl Hexide {
                                         // Convert offset to line number (each line shows 16 bytes)
                                         let line = offset / 16;
                                         // Convert to usize and handle potential overflow
-                                        let max_scroll = self.max_vertical_scroll(visible_rows);
-                                        self.vertical_scroll = (line as usize).min(max_scroll);
+                                        let max_line = self.total_rows().saturating_sub(1);
+                                        self.highlighted_line = (line as usize).min(max_line);
+                                        self.ensure_highlighted_visible(visible_rows);
                                     }
 
                                     self.mode = Mode::Normal;
@@ -281,7 +319,7 @@ impl Hexide {
 
         match self.mode {
             Mode::Normal => {
-                let help_text = " ↑/↓/←/→: Scroll | PgUp/PgDn: Page | Home/End: Jump | q: Quit ";
+                let help_text = " ↑/↓: Move highlight | j/k: Scroll | PgUp/PgDn: Page | Home/End: Jump | q: Quit ";
                 let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
                     .style(Style::default().fg(Color::Gray));
                 f.render_widget(help_paragraph, help_layout[1]);
@@ -325,17 +363,26 @@ impl Hexide {
         let mut lines = Vec::new();
 
         for row in 0..visible_rows {
-            let offset = (start_row + row) * 16;
+            let current_row = start_row + row;
+            let offset = current_row * 16;
             if offset >= self.file_data.len() {
                 break;
             }
 
             let mut line_spans = Vec::new();
 
+            // Determine if this is the highlighted line
+            let is_highlighted = current_row == self.highlighted_line;
+            let base_style = if is_highlighted {
+                Style::default().bg(Color::Black)
+            } else {
+                Style::default()
+            };
+
             // Add offset in gray
             line_spans.push(Span::styled(
                 format!(" {:0fill$x}:  ", offset, fill = self.max_offset()),
-                Style::default().fg(Color::DarkGray),
+                base_style.fg(Color::DarkGray),
             ));
 
             // Add hex values with colors based on content
@@ -344,22 +391,19 @@ impl Hexide {
                 if pos < self.file_data.len() {
                     let byte = self.file_data[pos];
                     let color = self.get_byte_color(byte);
-                    line_spans.push(Span::styled(
-                        format!("{:02x} ", byte),
-                        Style::default().fg(color),
-                    ));
+                    line_spans.push(Span::styled(format!("{:02x} ", byte), base_style.fg(color)));
                 } else {
-                    line_spans.push(Span::raw("   "));
+                    line_spans.push(Span::styled("   ", base_style));
                 }
 
                 // Add extra space in the middle
                 if i == 7 {
-                    line_spans.push(Span::raw(" "));
+                    line_spans.push(Span::styled(" ", base_style));
                 }
             }
 
             // Add ASCII representation with matching colors
-            line_spans.push(Span::raw(" |"));
+            line_spans.push(Span::styled(" |", base_style));
             for i in 0..16 {
                 let pos = offset + i;
                 if pos < self.file_data.len() {
@@ -372,10 +416,10 @@ impl Hexide {
                         // Non-printable character
                         '.'
                     };
-                    line_spans.push(Span::styled(c.to_string(), Style::default().fg(color)));
+                    line_spans.push(Span::styled(c.to_string(), base_style.fg(color)));
                 }
             }
-            line_spans.push(Span::raw("| "));
+            line_spans.push(Span::styled("| ", base_style));
 
             // Add the line to our collection
             lines.push(Line::from(line_spans));
