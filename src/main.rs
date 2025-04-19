@@ -1,14 +1,13 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     prelude::*,
@@ -24,71 +23,60 @@ enum Mode {
 }
 
 struct Hexide {
-    file_data: Vec<u8>,
-    vertical_scroll: usize,
-    horizontal_scroll: usize,
+    bytes: Vec<u8>,
+    cursor_row: usize,
+    scroll_row: usize,
+    scroll_col: usize,
     filename: String,
     mode: Mode,
-    highlighted_line: usize, // New field to track highlighted line
 }
 
 impl Hexide {
     fn new(filename: &str) -> Result<Self> {
-        let path = Path::new(filename);
-        let mut file = File::open(path).context("Failed to open file")?;
+        let mut file = File::open(filename).context("Failed to open file")?;
         let mut file_data = Vec::new();
         file.read_to_end(&mut file_data)
             .context("Failed to read file")?;
 
         Ok(Self {
-            file_data,
-            vertical_scroll: 0,
-            horizontal_scroll: 0,
+            bytes: file_data,
+            scroll_row: 0,
+            scroll_col: 0,
             filename: filename.to_string(),
             mode: Mode::Normal,
-            highlighted_line: 0, // Start with the first line highlighted
+            cursor_row: 0,
         })
     }
 
     fn max_offset(&self) -> usize {
-        format!("{:x}", self.file_data.len()).len().max(8)
+        format!("{:x}", self.bytes.len()).len().max(8)
     }
 
-    // Calculate the total content width
     fn content_width(&self) -> usize {
-        // 10 for offset, 3 per byte in hex, 2 for separator, 16 for ASCII, 2 for borders
         1 + self.max_offset() + 1 + 16 * 3 + 2 + 16 + 2 + 1
     }
 
-    // Calculate the total number of rows in the file
     fn total_rows(&self) -> usize {
-        (self.file_data.len() + 15) / 16 // Ceiling division by 16
+        (self.bytes.len() + 15) / 16
     }
 
-    // Calculate the maximum scroll position based on visible rows
     fn max_vertical_scroll(&self, visible_rows: usize) -> usize {
         let total = self.total_rows();
         if total <= visible_rows {
-            0 // No scrolling needed if all content fits
+            0
         } else {
             total - visible_rows
         }
     }
 
-    // Ensure highlighted line is visible by adjusting scroll if needed
     fn ensure_highlighted_visible(&mut self, visible_rows: usize) {
-        // If highlighted line is before visible area, scroll up
-        if self.highlighted_line < self.vertical_scroll {
-            self.vertical_scroll = self.highlighted_line;
-        }
-        // If highlighted line is after visible area, scroll down
-        else if self.highlighted_line >= self.vertical_scroll + visible_rows {
-            self.vertical_scroll = self.highlighted_line.saturating_sub(visible_rows) + 1;
+        if self.cursor_row < self.scroll_row {
+            self.scroll_row = self.cursor_row;
+        } else if self.cursor_row >= self.scroll_row + visible_rows {
+            self.scroll_row = self.cursor_row.saturating_sub(visible_rows) + 1;
         }
 
-        // Make sure we don't scroll past the end
-        let max_scroll = self.max_vertical_scroll(visible_rows);
-        self.vertical_scroll = self.vertical_scroll.min(max_scroll);
+        self.scroll_row = self.scroll_row.min(self.max_vertical_scroll(visible_rows));
     }
 
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
@@ -100,7 +88,7 @@ impl Hexide {
 
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
+                .unwrap_or_default();
 
             if crossterm::event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
@@ -109,92 +97,73 @@ impl Hexide {
                         let visible_rows = terminal_size.height.saturating_sub(2) as usize;
                         let visible_width = terminal_size.width.saturating_sub(4) as usize;
 
-                        match self.mode {
+                        match &mut self.mode {
                             Mode::Normal => match key.code {
                                 KeyCode::Char('q') => return Ok(()),
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    // Move highlight down
                                     let max_line = self.total_rows().saturating_sub(1);
-                                    self.highlighted_line =
-                                        self.highlighted_line.saturating_add(1).min(max_line);
+                                    self.cursor_row =
+                                        self.cursor_row.saturating_add(1).min(max_line);
                                     self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    // Move highlight up
-                                    self.highlighted_line = self.highlighted_line.saturating_sub(1);
+                                    self.cursor_row = self.cursor_row.saturating_sub(1);
                                     self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::Right | KeyCode::Char('l') => {
                                     let content_width = self.content_width();
-
-                                    // Only scroll if content is wider than visible area
                                     if content_width > visible_width {
                                         let max_scroll =
                                             content_width.saturating_sub(visible_width);
-                                        self.horizontal_scroll = self
-                                            .horizontal_scroll
-                                            .saturating_add(1)
-                                            .min(max_scroll);
+                                        self.scroll_col =
+                                            self.scroll_col.saturating_add(1).min(max_scroll);
                                     }
                                 }
                                 KeyCode::Left | KeyCode::Char('h') => {
-                                    self.horizontal_scroll =
-                                        self.horizontal_scroll.saturating_sub(1);
+                                    self.scroll_col = self.scroll_col.saturating_sub(1);
                                 }
                                 KeyCode::PageDown => {
-                                    // Move highlight down by a page
                                     let max_line = self.total_rows().saturating_sub(1);
-                                    self.highlighted_line = self
-                                        .highlighted_line
-                                        .saturating_add(visible_rows)
-                                        .min(max_line);
+                                    self.cursor_row =
+                                        self.cursor_row.saturating_add(visible_rows).min(max_line);
                                     self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::PageUp => {
-                                    // Move highlight up by a page
-                                    let page_size = visible_rows;
-                                    self.highlighted_line =
-                                        self.highlighted_line.saturating_sub(page_size);
+                                    self.cursor_row = self.cursor_row.saturating_sub(visible_rows);
                                     self.ensure_highlighted_visible(visible_rows);
                                 }
                                 KeyCode::Home => {
-                                    self.highlighted_line = 0;
-                                    self.vertical_scroll = 0;
-                                    self.horizontal_scroll = 0;
+                                    self.cursor_row = 0;
+                                    self.scroll_row = 0;
+                                    self.scroll_col = 0;
                                 }
                                 KeyCode::End => {
-                                    self.highlighted_line = self.total_rows().saturating_sub(1);
-                                    self.vertical_scroll = self.max_vertical_scroll(visible_rows);
+                                    self.cursor_row = self.total_rows().saturating_sub(1);
+                                    self.scroll_row = self.max_vertical_scroll(visible_rows);
                                 }
                                 KeyCode::Char(':') => {
                                     self.mode = Mode::Command(String::new());
                                 }
                                 _ => {}
                             },
-                            Mode::Command(ref mut cmd) => match key.code {
+                            Mode::Command(cmd) => match key.code {
                                 KeyCode::Esc => {
                                     self.mode = Mode::Normal;
                                 }
                                 KeyCode::Enter => {
-                                    // Parse the command to get a decimal offset
                                     if let Ok(offset) = cmd.trim().parse::<u64>() {
-                                        // Convert offset to line number (each line shows 16 bytes)
                                         let line = offset / 16;
-                                        // Convert to usize and handle potential overflow
                                         let max_line = self.total_rows().saturating_sub(1);
-                                        self.highlighted_line = (line as usize).min(max_line);
+                                        self.cursor_row = (line as usize).min(max_line);
                                         self.ensure_highlighted_visible(visible_rows);
                                     }
-
                                     self.mode = Mode::Normal;
                                 }
                                 KeyCode::Backspace => {
                                     cmd.pop();
                                 }
-                                KeyCode::Char(c) => {
-                                    if c.is_ascii_digit() {
-                                        cmd.push(c);
-                                    }
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    cmd.push(c);
                                 }
                                 _ => {}
                             },
@@ -209,58 +178,47 @@ impl Hexide {
         }
     }
 
-    fn substitute_home(&self) -> String {
-        if let Ok(home) = env::var("HOME") {
-            if self.filename.starts_with(&home) {
-                return self.filename.replacen(&home, "~", 1);
-            }
-        }
-        self.filename.clone()
-    }
-
     fn truncate_path(&self, width: usize) -> String {
-        self.substitute_home()
+        let display_path = if let Ok(home) = env::var("HOME") {
+            if self.filename.starts_with(&home) {
+                self.filename.replacen(&home, "~", 1)
+            } else {
+                self.filename.clone()
+            }
+        } else {
+            self.filename.clone()
+        };
+
+        display_path
             .split('/')
             .last()
-            .unwrap_or(&self.filename)
-            .to_string()
+            .unwrap_or(&display_path)
             .chars()
             .take(width)
-            .collect::<String>()
-    }
-
-    fn title(&self, width: usize) -> String {
-        let max_width = width - " hexide -  ".len();
-        format!(" hexide - {} ", self.truncate_path(max_width))
+            .collect()
     }
 
     fn ui(&self, f: &mut Frame) {
         let area = f.area();
-
-        // Calculate how many rows we can display
         let visible_rows = area.height.saturating_sub(2) as usize;
 
-        // Generate the hex dump content
-        let content = self.format_hex_dump_colored(self.vertical_scroll, visible_rows);
-
-        // Create a block with rounded borders
+        // Create block and paragraph
         let block = Block::default()
-            .title(self.title((area.width as usize) - 2))
+            .title(format!(
+                " hexide - {} ",
+                self.truncate_path((area.width as usize) - " hexide -  ".len() - 2)
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
 
-        // Create a paragraph with the hex dump content
-        let paragraph = Paragraph::new(content)
+        let paragraph = Paragraph::new(self.format_hex_dump_colored(self.scroll_row, visible_rows))
             .block(block)
-            .scroll((0, self.horizontal_scroll as u16));
+            .scroll((0, self.scroll_col as u16));
 
-        // Render the paragraph
         f.render_widget(paragraph, area);
 
-        // Calculate total rows and create vertical scrollbar
+        // Render scrollbar if needed
         let total_rows = self.total_rows();
-
-        // Only show vertical scrollbar if content is taller than visible area
         if total_rows > visible_rows {
             let vertical_scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
@@ -268,33 +226,29 @@ impl Hexide {
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"));
 
-            let mut vertical_scrollbar_state = ScrollbarState::default()
+            let mut scrollbar_state = ScrollbarState::default()
                 .content_length(total_rows - visible_rows)
-                .position(self.vertical_scroll)
+                .position(self.scroll_row)
                 .viewport_content_length(visible_rows);
 
-            let vertical_scrollbar_area = Layout::default()
+            let scrollbar_area = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
 
-            let vertical_scrollbar_area = Layout::default()
+            let scrollbar_area = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1),
                     Constraint::Min(1),
                     Constraint::Length(1),
                 ])
-                .split(vertical_scrollbar_area[1]);
+                .split(scrollbar_area[1]);
 
-            f.render_stateful_widget(
-                vertical_scrollbar,
-                vertical_scrollbar_area[1],
-                &mut vertical_scrollbar_state,
-            );
+            f.render_stateful_widget(vertical_scrollbar, scrollbar_area[1], &mut scrollbar_state);
         }
 
-        // Add a help message at the bottom
+        // Render help text
         let help_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -309,82 +263,61 @@ impl Hexide {
             ])
             .split(help_layout[1]);
 
-        match self.mode {
-            Mode::Normal => {
-                let help_text =
-                    " j/k/h/l: Move | PgUp/PgDn: Page | Home/End: Top/Bottom | q: Quit ";
-                let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
-                    .style(Style::default().fg(Color::Gray));
-                f.render_widget(help_paragraph, help_layout[1]);
-            }
-            Mode::Command(ref cmd) => {
-                let help_text = format!(" Offset: {} ", cmd);
-                let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
-                    .style(Style::default().fg(Color::Gray));
-                f.render_widget(help_paragraph, help_layout[1]);
-            }
-        }
+        let help_text = match &self.mode {
+            Mode::Normal => " j/k/h/l: Move | PgUp/PgDn: Page | Home/End: Top/Bottom | q: Quit ",
+            Mode::Command(cmd) => &format!(" Offset: {} ", cmd),
+        };
+
+        let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
+            .style(Style::default().fg(Color::Gray));
+        f.render_widget(help_paragraph, help_layout[1]);
     }
 
     fn get_byte_color(&self, byte: u8) -> Color {
-        // Determine color based on byte content
-        if byte == 0x00 {
-            // Null byte
-            Color::Black
-        } else if byte.is_ascii_digit() {
-            // Numbers (0-9)
-            Color::Red
-        } else if byte.is_ascii_alphabetic() {
-            // Letters (a-z, A-Z)
-            Color::Magenta
-        } else if byte.is_ascii_punctuation() {
-            // Symbols
-            Color::Blue
-        } else if byte.is_ascii_whitespace() {
-            // Whitespace
-            Color::Green
-        } else if byte.is_ascii_control() {
-            // Control characters
-            Color::Yellow
-        } else {
-            // Other characters
-            Color::Cyan
+        match byte {
+            0x00 => Color::Black,
+            b if b.is_ascii_digit() => Color::Red,
+            b if b.is_ascii_alphabetic() => Color::Magenta,
+            b if b.is_ascii_punctuation() => Color::Blue,
+            b if b.is_ascii_whitespace() => Color::Green,
+            b if b.is_ascii_control() => Color::Yellow,
+            _ => Color::Cyan,
         }
     }
 
     fn format_hex_dump_colored(&self, start_row: usize, visible_rows: usize) -> Text<'static> {
-        let mut lines = Vec::new();
+        let mut lines = Vec::with_capacity(visible_rows);
 
         for row in 0..visible_rows {
             let current_row = start_row + row;
             let offset = current_row * 16;
-            if offset >= self.file_data.len() {
+            if offset >= self.bytes.len() {
                 break;
             }
 
             let mut line_spans = Vec::new();
-
-            // Determine if this is the highlighted line
-            let is_highlighted = current_row == self.highlighted_line;
+            let is_highlighted = current_row == self.cursor_row;
             let base_style = if is_highlighted {
                 Style::default().bg(Color::Black)
             } else {
                 Style::default()
             };
 
-            // Add offset in gray
+            // Add offset
             line_spans.push(Span::styled(
                 format!(" {:0fill$x}:  ", offset, fill = self.max_offset()),
                 base_style.fg(Color::DarkGray),
             ));
 
-            // Add hex values with colors based on content
+            // Add hex values
             for i in 0..16 {
                 let pos = offset + i;
-                if pos < self.file_data.len() {
-                    let byte = self.file_data[pos];
-                    let color = self.get_byte_color(byte);
-                    line_spans.push(Span::styled(format!("{:02x} ", byte), base_style.fg(color)));
+                if pos < self.bytes.len() {
+                    let byte = self.bytes[pos];
+                    line_spans.push(Span::styled(
+                        format!("{:02x} ", byte),
+                        base_style.fg(self.get_byte_color(byte)),
+                    ));
                 } else {
                     line_spans.push(Span::styled("   ", base_style));
                 }
@@ -395,26 +328,25 @@ impl Hexide {
                 }
             }
 
-            // Add ASCII representation with matching colors
+            // Add ASCII representation
             line_spans.push(Span::styled(" |", base_style));
             for i in 0..16 {
                 let pos = offset + i;
-                if pos < self.file_data.len() {
-                    let byte = self.file_data[pos];
-                    let color = self.get_byte_color(byte);
+                if pos < self.bytes.len() {
+                    let byte = self.bytes[pos];
                     let c = if byte >= 32 && byte <= 126 {
-                        // Printable ASCII
                         byte as char
                     } else {
-                        // Non-printable character
                         '.'
                     };
-                    line_spans.push(Span::styled(c.to_string(), base_style.fg(color)));
+                    line_spans.push(Span::styled(
+                        c.to_string(),
+                        base_style.fg(self.get_byte_color(byte)),
+                    ));
                 }
             }
             line_spans.push(Span::styled("| ", base_style));
 
-            // Add the line to our collection
             lines.push(Line::from(line_spans));
         }
 
@@ -423,7 +355,6 @@ impl Hexide {
 }
 
 fn main() -> Result<()> {
-    // Parse command line arguments
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -431,22 +362,20 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let filename = &args[1];
-
     // Setup terminal
-    enable_raw_mode()?;
+    terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app and run it
-    let mut app = Hexide::new(filename)?;
+    // Run app
+    let mut app = Hexide::new(&args[1])?;
     let res = app.run(&mut terminal);
 
     // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen,)?;
+    terminal::disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
