@@ -20,6 +20,73 @@ use ratatui::{
 enum Mode {
     Normal,
     Command(String),
+    Search(String),
+}
+
+struct SearchState {
+    query: String,
+    results: Vec<usize>,
+    current_result: Option<usize>,
+    search_in_progress: bool,
+    search_position: usize, // Track where we are in the incremental search
+    chunk_size: usize,      // How many bytes to search at once
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            results: Vec::new(),
+            current_result: None,
+            search_in_progress: false,
+            search_position: 0,
+            chunk_size: 16 << 10, // Default chunk size for searching
+        }
+    }
+
+    fn next_result(&mut self) -> Option<usize> {
+        if self.results.is_empty() {
+            return None;
+        }
+
+        match self.current_result {
+            None => {
+                self.current_result = Some(0);
+                Some(self.results[0])
+            }
+            Some(idx) if idx + 1 < self.results.len() => {
+                self.current_result = Some(idx + 1);
+                Some(self.results[idx + 1])
+            }
+            _ => self.current_result.map(|idx| self.results[idx]),
+        }
+    }
+
+    fn prev_result(&mut self) -> Option<usize> {
+        if self.results.is_empty() {
+            return None;
+        }
+
+        match self.current_result {
+            None => {
+                self.current_result = Some(0);
+                Some(self.results[0])
+            }
+            Some(idx) if idx > 0 => {
+                self.current_result = Some(idx - 1);
+                Some(self.results[idx - 1])
+            }
+            _ => self.current_result.map(|idx| self.results[idx]),
+        }
+    }
+
+    fn reset_search(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.results.clear();
+        self.current_result = None;
+        self.search_in_progress = true;
+        self.search_position = 0;
+    }
 }
 
 struct Hexide {
@@ -29,6 +96,7 @@ struct Hexide {
     scroll_col: usize,
     filename: String,
     mode: Mode,
+    search: SearchState,
 }
 
 impl Hexide {
@@ -45,6 +113,7 @@ impl Hexide {
             filename: filename.to_string(),
             mode: Mode::Normal,
             cursor_row: 0,
+            search: SearchState::new(),
         })
     }
 
@@ -79,11 +148,129 @@ impl Hexide {
         self.scroll_row = self.scroll_row.min(self.max_vertical_scroll(visible_rows));
     }
 
+    fn goto_search_result(&mut self, offset: usize, visible_rows: usize) {
+        let row = offset / 16;
+        self.cursor_row = row;
+        self.ensure_highlighted_visible(visible_rows);
+    }
+
+    fn next_search_result(&mut self, visible_rows: usize) -> bool {
+        if let Some(offset) = self.search.next_result() {
+            self.goto_search_result(offset, visible_rows);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prev_search_result(&mut self, visible_rows: usize) -> bool {
+        if let Some(offset) = self.search.prev_result() {
+            self.goto_search_result(offset, visible_rows);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn start_search(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+        self.search.reset_search(query);
+
+        // Search visible region first
+        let visible_start = self.scroll_row * 16;
+        let visible_end = (self.scroll_row + 30) * 16; // Approximate visible area
+        let visible_end = visible_end.min(self.bytes.len());
+
+        self.search_chunk(visible_start, visible_end);
+
+        // Set search position to start from beginning for the rest of the file
+        self.search.search_position = 0;
+    }
+
+    fn continue_search(&mut self) -> bool {
+        if !self.search.search_in_progress {
+            return false;
+        }
+
+        let start = self.search.search_position;
+        let end = (start + self.search.chunk_size).min(self.bytes.len());
+
+        // Skip the visible region if we've already searched it
+        let visible_start = self.scroll_row * 16;
+        let visible_end = (self.scroll_row + 30) * 16;
+        let visible_end = visible_end.min(self.bytes.len());
+
+        if start < visible_end && end > visible_start {
+            // We're in the visible region, which we've already searched
+            self.search.search_position = visible_end;
+            return self.continue_search();
+        }
+
+        let found_results = self.search_chunk(start, end);
+
+        // Update search position
+        self.search.search_position = end;
+
+        // Check if search is complete
+        if end >= self.bytes.len() {
+            self.search.search_in_progress = false;
+        }
+
+        found_results
+    }
+
+    fn search_chunk(&mut self, start: usize, end: usize) -> bool {
+        let query = &self.search.query;
+        let mut found_results = false;
+
+        // Check if the query is a hex value
+        if query.starts_with("0x") {
+            // Parse hex value
+            let hex_query = if query.starts_with("0x") {
+                &query[2..]
+            } else {
+                query
+            };
+
+            if let Ok(byte_value) = u8::from_str_radix(hex_query, 16) {
+                // Search for the byte value in this chunk
+                for i in start..end {
+                    if self.bytes[i] == byte_value {
+                        self.search.results.push(i);
+                        found_results = true;
+                    }
+                }
+            }
+        } else {
+            // Search for ASCII string in this chunk
+            let query_bytes = query.as_bytes();
+            if !query_bytes.is_empty() {
+                for i in start..=end.saturating_sub(query_bytes.len()) {
+                    if i + query_bytes.len() <= self.bytes.len()
+                        && self.bytes[i..].starts_with(query_bytes)
+                    {
+                        self.search.results.push(i);
+                        found_results = true;
+                    }
+                }
+            }
+        }
+
+        found_results
+    }
+
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(250);
 
         loop {
+            // Continue incremental search if in progress
+            if self.search.search_in_progress {
+                self.continue_search();
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             let timeout = tick_rate
@@ -144,6 +331,15 @@ impl Hexide {
                                 KeyCode::Char(':') => {
                                     self.mode = Mode::Command(String::new());
                                 }
+                                KeyCode::Char('/') => {
+                                    self.mode = Mode::Search(String::new());
+                                }
+                                KeyCode::Char('n') => {
+                                    self.next_search_result(visible_rows);
+                                }
+                                KeyCode::Char('N') => {
+                                    self.prev_search_result(visible_rows);
+                                }
                                 _ => {}
                             },
                             Mode::Command(cmd) => match key.code {
@@ -164,6 +360,26 @@ impl Hexide {
                                 }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     cmd.push(c);
+                                }
+                                _ => {}
+                            },
+                            Mode::Search(query) => match key.code {
+                                KeyCode::Esc => {
+                                    self.mode = Mode::Normal;
+                                }
+                                KeyCode::Enter => {
+                                    let query_clone = query.clone();
+                                    if !query_clone.is_empty() {
+                                        self.start_search(&query_clone);
+                                        self.next_search_result(visible_rows);
+                                    }
+                                    self.mode = Mode::Normal;
+                                }
+                                KeyCode::Backspace => {
+                                    query.pop();
+                                }
+                                KeyCode::Char(c) => {
+                                    query.push(c);
                                 }
                                 _ => {}
                             },
@@ -264,8 +480,34 @@ impl Hexide {
             .split(help_layout[1]);
 
         let help_text = match &self.mode {
-            Mode::Normal => " j/k: ↑/↓ | h/l: ←/→ | q: Quit ",
-            Mode::Command(cmd) => &format!(" Offset: {} ", cmd),
+            Mode::Normal => {
+                let search_info = if !self.search.results.is_empty() {
+                    let progress = if self.search.search_in_progress {
+                        format!(
+                            "[{}/{}...]",
+                            self.search.current_result.map_or(0, |i| i + 1),
+                            self.search.results.len()
+                        )
+                    } else {
+                        format!(
+                            "[{}/{}]",
+                            self.search.current_result.map_or(0, |i| i + 1),
+                            self.search.results.len()
+                        )
+                    };
+                    progress
+                } else if self.search.search_in_progress {
+                    "[...]".to_string()
+                } else {
+                    String::new()
+                };
+                format!(
+                    " j/k: ↑/↓ | h/l: ←/→ | :: Offset | /: Search{} | q: Quit ",
+                    search_info
+                )
+            }
+            Mode::Command(cmd) => format!(" Offset: {} ", cmd),
+            Mode::Search(query) => format!(" Search: {} ", query),
         };
 
         let help_paragraph = Paragraph::new(Line::from(help_text).left_aligned())
@@ -283,6 +525,47 @@ impl Hexide {
             b if b.is_ascii_control() => Color::Yellow,
             _ => Color::Cyan,
         }
+    }
+
+    fn is_byte_in_search_result(&self, pos: usize) -> bool {
+        if self.search.results.is_empty() {
+            return false;
+        }
+
+        // Check if this byte is part of any search result
+        for &result_pos in &self.search.results {
+            let query_len = if self.search.query.starts_with("0x")
+                || self.search.query.chars().all(|c| c.is_digit(16))
+            {
+                1 // Hex search is always 1 byte
+            } else {
+                self.search.query.len()
+            };
+
+            if pos >= result_pos && pos < result_pos + query_len {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn is_current_search_result(&self, pos: usize) -> bool {
+        if let Some(current_idx) = self.search.current_result {
+            if current_idx < self.search.results.len() {
+                let result_pos = self.search.results[current_idx];
+                let query_len = if self.search.query.starts_with("0x")
+                    || self.search.query.chars().all(|c| c.is_digit(16))
+                {
+                    1 // Hex search is always 1 byte
+                } else {
+                    self.search.query.len()
+                };
+
+                return pos >= result_pos && pos < result_pos + query_len;
+            }
+        }
+        false
     }
 
     fn format_hex_dump_colored(&self, start_row: usize, visible_rows: usize) -> Text<'static> {
@@ -306,7 +589,11 @@ impl Hexide {
             // Add offset
             line_spans.push(Span::styled(
                 format!(" {:0fill$x}:  ", offset, fill = self.max_offset()),
-                base_style.fg(Color::DarkGray),
+                if is_highlighted {
+                    base_style.fg(Color::Gray)
+                } else {
+                    base_style.fg(Color::DarkGray)
+                },
             ));
 
             // Add hex values
@@ -314,10 +601,28 @@ impl Hexide {
                 let pos = offset + i;
                 if pos < self.bytes.len() {
                     let byte = self.bytes[pos];
-                    line_spans.push(Span::styled(
-                        format!("{:02x} ", byte),
-                        base_style.fg(self.get_byte_color(byte)),
-                    ));
+                    let mut byte_style = base_style.fg(self.get_byte_color(byte));
+                    let mut space_style = byte_style; // Default: space has same style as byte
+
+                    // Highlight search results
+                    if self.is_byte_in_search_result(pos) {
+                        byte_style = if self.is_current_search_result(pos) {
+                            byte_style.bg(Color::Yellow).fg(Color::Black)
+                        } else {
+                            byte_style.bg(Color::Rgb(0x45, 0x39, 0x35)).fg(Color::White)
+                        };
+
+                        // Check if this is the last byte of a search result
+                        let is_last_byte_of_search = !self.is_byte_in_search_result(pos + 1);
+                        if is_last_byte_of_search {
+                            space_style = base_style; // Use base style for space after last byte
+                        } else {
+                            space_style = byte_style; // Otherwise, space has same highlight as byte
+                        }
+                    }
+
+                    line_spans.push(Span::styled(format!("{:02x}", byte), byte_style));
+                    line_spans.push(Span::styled(" ", space_style));
                 } else {
                     line_spans.push(Span::styled("   ", base_style));
                 }
@@ -339,10 +644,19 @@ impl Hexide {
                     } else {
                         '.'
                     };
-                    line_spans.push(Span::styled(
-                        c.to_string(),
-                        base_style.fg(self.get_byte_color(byte)),
-                    ));
+
+                    let mut style = base_style.fg(self.get_byte_color(byte));
+
+                    // Highlight search results
+                    if self.is_byte_in_search_result(pos) {
+                        style = if self.is_current_search_result(pos) {
+                            style.bg(Color::Yellow).fg(Color::Black)
+                        } else {
+                            style.bg(Color::Rgb(0x45, 0x39, 0x35)).fg(Color::White)
+                        };
+                    }
+
+                    line_spans.push(Span::styled(c.to_string(), style));
                 }
             }
             line_spans.push(Span::styled("| ", base_style));
