@@ -107,11 +107,12 @@ impl SearchState {
     }
 
     fn query_len(&self) -> usize {
-        if self.query.starts_with("0x") || self.query.chars().all(|c| c.is_digit(16)) {
-            1 // Hex search is always 1 byte
-        } else {
-            self.query.len()
+        if let Some(hex_query) = self.query.strip_prefix("0x") {
+            if hex_query.chars().all(|c| c.is_ascii_hexdigit()) {
+                return hex_query.len() / 2;
+            }
         }
+        self.query.len()
     }
 
     fn status_text(&self) -> String {
@@ -173,16 +174,12 @@ impl Hexide {
     }
 
     fn total_rows(&self) -> usize {
-        (self.bytes.len() + 15) / 16
+        self.bytes.len().div_ceil(16)
     }
 
     fn max_vertical_scroll(&self, visible_rows: usize) -> usize {
         let total = self.total_rows();
-        if total <= visible_rows {
-            0
-        } else {
-            total - visible_rows
-        }
+        total.saturating_sub(visible_rows)
     }
 
     // Navigation
@@ -257,14 +254,7 @@ impl Hexide {
         let mut found_results = false;
 
         // Check if the query is a hex value
-        if query.starts_with("0x") {
-            // Parse hex value
-            let hex_query = if query.starts_with("0x") {
-                &query[2..]
-            } else {
-                query
-            };
-
+        if let Some(hex_query) = query.strip_prefix("0x") {
             if let Ok(byte_value) = u8::from_str_radix(hex_query, 16) {
                 // Search for the byte value in this chunk
                 for i in start..end {
@@ -314,7 +304,7 @@ impl Hexide {
     fn truncate_path(&self, width: usize) -> String {
         self.filename
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or(&self.filename)
             .chars()
             .take(width)
@@ -651,7 +641,7 @@ impl Hexide {
 
     fn add_ascii_char(&self, line_spans: &mut Vec<Span<'static>>, pos: usize, base_style: Style) {
         let byte = self.bytes[pos];
-        let c = if byte >= 32 && byte <= 126 {
+        let c = if (32..=126).contains(&byte) {
             byte as char
         } else {
             '.'
