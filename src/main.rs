@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
+use std::panic;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -673,19 +674,25 @@ fn main() -> Result<()> {
 
     // Setup terminal
     terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    panic::set_hook(Box::new(|info| {
+        terminal::disable_raw_mode().ok();
+        println!("Error: {:?}", info);
+    }));
+
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
 
     // Run app
     let mut app = Hexide::new(&args[1])?;
     let res = app.run(&mut terminal);
 
     // Restore terminal
-    terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
 
     if let Err(err) = res {
         println!("{:?}", err);
