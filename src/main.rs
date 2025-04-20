@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::File;
+use std::io::Seek;
 use std::io::{self, Read};
 use std::panic;
 use std::time::{Duration, Instant};
@@ -143,15 +144,32 @@ struct Hexide {
     filename: String,
     mode: Mode,
     search: SearchState,
+    start_offset: usize,
 }
 
 // ===== Implementation =====
 
 impl Hexide {
-    fn new(filename: &str) -> Result<Self> {
+    fn new(filename: &str, start_offset: usize, max_bytes: Option<usize>) -> Result<Self> {
         let mut file = File::open(filename).context("Failed to open file")?;
         let mut file_data = Vec::new();
-        file.read_to_end(&mut file_data)
+        let metadata = file.metadata().context("Failed to get file metadata")?;
+
+        if start_offset as u64 >= metadata.len() {
+            return Err(anyhow::anyhow!("Start offset is beyond file size"));
+        } else if start_offset > 0 {
+            file.seek(std::io::SeekFrom::Start(start_offset as u64))
+                .context("Failed to seek in file")?;
+        }
+
+        let mut handle = if let Some(limit) = max_bytes {
+            file.take(limit as u64)
+        } else {
+            file.take(metadata.len())
+        };
+
+        handle
+            .read_to_end(&mut file_data)
             .context("Failed to read file")?;
 
         Ok(Self {
@@ -162,12 +180,15 @@ impl Hexide {
             mode: Mode::Normal,
             cursor_row: 0,
             search: SearchState::new(),
+            start_offset,
         })
     }
 
     // Layout calculations
     fn max_offset(&self) -> usize {
-        format!("{:x}", self.bytes.len()).len().max(8)
+        format!("{:x}", self.start_offset + self.bytes.len())
+            .len()
+            .max(8)
     }
 
     fn content_width(&self) -> usize {
@@ -572,9 +593,13 @@ impl Hexide {
                 Style::default()
             };
 
-            // Add offset
+            // Add offset (adjusted for start_offset)
             line_spans.push(Span::styled(
-                format!(" {:0fill$x}:  ", offset, fill = self.max_offset()),
+                format!(
+                    " {:0fill$x}:  ",
+                    offset + self.start_offset,
+                    fill = self.max_offset()
+                ),
                 if is_highlighted {
                     base_style.fg(Color::Gray)
                 } else {
@@ -668,9 +693,58 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <filename>", args[0]);
+        eprintln!("Usage: {} <filename> [-s offset] [-n bytes]", args[0]);
         std::process::exit(1);
     }
+
+    // Parse command line arguments
+    let mut filename = None;
+    let mut start_offset = 0;
+    let mut max_bytes = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" => {
+                if i + 1 < args.len() {
+                    start_offset = args[i + 1].parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("Invalid offset value: {}", args[i + 1]);
+                        std::process::exit(1);
+                    });
+                    i += 2;
+                } else {
+                    eprintln!("Missing value for -s option");
+                    std::process::exit(1);
+                }
+            }
+            "-n" => {
+                if i + 1 < args.len() {
+                    max_bytes = Some(args[i + 1].parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("Invalid bytes value: {}", args[i + 1]);
+                        std::process::exit(1);
+                    }));
+                    i += 2;
+                } else {
+                    eprintln!("Missing value for -n option");
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                filename = Some(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    let filename = match filename {
+        Some(name) => name,
+        None => {
+            eprintln!("No filename specified");
+            std::process::exit(1);
+        }
+    };
+
+    let mut app = Hexide::new(&filename, start_offset, max_bytes)?;
 
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -686,7 +760,6 @@ fn main() -> Result<()> {
     terminal.hide_cursor()?;
 
     // Run app
-    let mut app = Hexide::new(&args[1])?;
     let res = app.run(&mut terminal);
 
     // Restore terminal
