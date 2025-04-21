@@ -51,7 +51,6 @@ impl SearchState {
         if self.results.is_empty() {
             return None;
         }
-
         match self.current_result {
             None => {
                 self.current_result = Some(0);
@@ -69,7 +68,6 @@ impl SearchState {
         if self.results.is_empty() {
             return None;
         }
-
         match self.current_result {
             None => {
                 self.current_result = Some(0);
@@ -136,7 +134,11 @@ impl SearchState {
 }
 
 struct Hexide {
-    bytes: Vec<u8>,
+    // Fixed window cache based on the vision region
+    cache: Vec<u8>,
+    cache_start: usize, // file offset of cache[0]
+    cache_end: usize,   // file offset immediately after cache
+    total_file_size: usize,
     cursor_row: usize,
     scroll_row: usize,
     scroll_col: usize,
@@ -146,33 +148,36 @@ struct Hexide {
     start_offset: usize,
 }
 
-// ===== Implementation =====
-
 impl Hexide {
-    fn new(filename: &str, start_offset: usize, max_bytes: Option<usize>) -> Result<Self> {
+    /// Opens the file and reads an initial cache covering:
+    /// [ (1 vision region before visible) | (visible region) | (1 vision region after visible) ].
+    ///
+    /// The initial visible region is determined by the terminal size later, so here we load a minimal
+    /// cache starting at start_offset. It will be reloaded when UI size is known.
+    fn new(filename: &str, start_offset: usize, _max_bytes: Option<usize>) -> Result<Self> {
         let mut file = File::open(filename).context("Failed to open file")?;
-        let mut file_data = Vec::new();
         let metadata = file.metadata().context("Failed to get file metadata")?;
+        let file_size = metadata.len() as usize;
 
-        if start_offset as u64 >= metadata.len() {
+        if start_offset >= file_size {
             return Err(anyhow::anyhow!("Start offset is beyond file size"));
-        } else if start_offset > 0 {
-            file.seek(SeekFrom::Start(start_offset as u64))
-                .context("Failed to seek in file")?;
         }
 
-        let mut handle = if let Some(limit) = max_bytes {
-            file.take(limit as u64)
-        } else {
-            file.take(metadata.len())
-        };
-
-        handle
-            .read_to_end(&mut file_data)
-            .context("Failed to read file")?;
+        // Initially load a small cache window.
+        let initial_cache_size = 256;
+        let cache_end = (start_offset + initial_cache_size).min(file_size);
+        let cache_size = cache_end - start_offset;
+        let mut cache = vec![0u8; cache_size];
+        file.seek(SeekFrom::Start(start_offset as u64))
+            .context("Failed to seek in file")?;
+        file.read_exact(&mut cache)
+            .context("Failed to read initial cache window")?;
 
         Ok(Self {
-            bytes: file_data,
+            cache,
+            cache_start: start_offset,
+            cache_end,
+            total_file_size: file_size,
             scroll_row: 0,
             scroll_col: 0,
             filename: filename.to_string(),
@@ -183,19 +188,22 @@ impl Hexide {
         })
     }
 
-    // Layout calculations
+    /// Returns the number of hex digits needed to represent the final offset.
     fn max_offset(&self) -> usize {
-        format!("{:x}", self.start_offset + self.bytes.len())
+        format!("{:x}", self.start_offset + self.total_file_size)
             .len()
             .max(8)
     }
 
+    /// Rough content width calculation: offset field, hex bytes, ASCII representation,
+    /// surrounding spaces and borders.
     fn content_width(&self) -> usize {
         1 + self.max_offset() + 1 + 16 * 3 + 2 + 16 + 2 + 1
     }
 
+    /// Total rows in the file (each row is 16 bytes).
     fn total_rows(&self) -> usize {
-        self.bytes.len().div_ceil(16)
+        self.total_file_size.div_ceil(16)
     }
 
     fn max_vertical_scroll(&self, visible_rows: usize) -> usize {
@@ -203,14 +211,60 @@ impl Hexide {
         total.saturating_sub(visible_rows)
     }
 
-    // Navigation
+    // ----- Fixed-Size Cache with Vision Regions -----
+    ///
+    /// Given a visible region starting at `visible_start` (in bytes) with length `visible_length`
+    /// (in bytes), ensure the cache includes at least one full visible region before and one after.
+    ///
+    /// That is, reload the cache if needed to cover:
+    ///    desired_start = max(0, visible_start - visible_length)
+    ///    desired_end   = min(total_file_size, visible_start + (2 * visible_length))
+    ///
+    fn ensure_cache_contains_visible_region(
+        &mut self,
+        visible_start: usize,
+        visible_length: usize,
+    ) -> Result<()> {
+        let desired_start = visible_start.saturating_sub(visible_length);
+        let mut desired_end = visible_start + (2 * visible_length);
+        if desired_end > self.total_file_size {
+            desired_end = self.total_file_size;
+        }
+
+        // Reload cache if the currently desired window is not fully contained.
+        if desired_start < self.cache_start || desired_end > self.cache_end {
+            let new_cache_size = desired_end - desired_start;
+            let mut new_cache = vec![0u8; new_cache_size];
+            let mut file = File::open(&self.filename)?;
+            file.seek(SeekFrom::Start(desired_start as u64))?;
+            file.read_exact(&mut new_cache)?;
+            self.cache = new_cache;
+            self.cache_start = desired_start;
+            self.cache_end = desired_end;
+        }
+        Ok(())
+    }
+
+    /// Returns a byte at a given file offset. If present in cache, return it; otherwise read directly.
+    fn get_byte_at(&mut self, offset: usize) -> Result<u8> {
+        if offset >= self.cache_start && offset < self.cache_end {
+            Ok(self.cache[offset - self.cache_start])
+        } else {
+            let mut file = File::open(&self.filename)?;
+            file.seek(SeekFrom::Start(offset as u64))?;
+            let mut buf = [0u8; 1];
+            file.read_exact(&mut buf)?;
+            Ok(buf[0])
+        }
+    }
+
+    // ----- Navigation -----
     fn ensure_cursor_visible(&mut self, visible_rows: usize) {
         if self.cursor_row < self.scroll_row {
             self.scroll_row = self.cursor_row;
         } else if self.cursor_row >= self.scroll_row + visible_rows {
             self.scroll_row = self.cursor_row.saturating_sub(visible_rows) + 1;
         }
-
         self.scroll_row = self.scroll_row.min(self.max_vertical_scroll(visible_rows));
     }
 
@@ -220,87 +274,77 @@ impl Hexide {
         self.ensure_cursor_visible(visible_rows);
     }
 
-    // Search functionality
-    fn start_search(&mut self, query: &str) {
+    // ----- Search Functionality -----
+    ///
+    /// Begins a search by first scanning the visible region.
+    fn start_search(&mut self, query: &str, visible_rows: usize) -> Result<()> {
         if query.is_empty() {
-            return;
+            return Ok(());
         }
         self.search.reset(query);
-
-        // Search visible region first
         let visible_start = self.scroll_row * 16;
-        let visible_end = (self.scroll_row + 30) * 16; // Approximate visible area
-        let visible_end = visible_end.min(self.bytes.len());
-
-        self.search_chunk(visible_start, visible_end);
-
-        // Set search position to start from beginning for the rest of the file
+        let visible_end = (self.scroll_row + visible_rows) * 16;
+        self.search_chunk(visible_start, visible_end)?;
         self.search.search_position = 0;
+        Ok(())
     }
 
-    fn continue_search(&mut self) -> bool {
+    /// Continues an incremental search using fixed-size chunks.
+    fn continue_search(&mut self) -> Result<bool> {
         if !self.search.search_in_progress {
-            return false;
+            return Ok(false);
         }
-
         let start = self.search.search_position;
-        let end = (start + self.search.chunk_size).min(self.bytes.len());
-
-        // Skip the visible region if we've already searched it
+        let end = (start + self.search.chunk_size).min(self.total_file_size);
         let visible_start = self.scroll_row * 16;
-        let visible_end = (self.scroll_row + 30) * 16;
-        let visible_end = visible_end.min(self.bytes.len());
-
+        let visible_end = ((self.scroll_row + 30) * 16).min(self.total_file_size);
         if start < visible_end && end > visible_start {
-            // We're in the visible region, which we've already searched
             self.search.search_position = visible_end;
             return self.continue_search();
         }
-
-        let found_results = self.search_chunk(start, end);
-
-        // Update search position
+        let found = self.search_chunk(start, end)?;
         self.search.search_position = end;
-
-        // Check if search is complete
-        if end >= self.bytes.len() {
+        if end >= self.total_file_size {
             self.search.search_in_progress = false;
         }
-
-        found_results
+        Ok(found)
     }
 
-    fn search_chunk(&mut self, start: usize, end: usize) -> bool {
-        let query = &self.search.query;
+    /// Scans file bytes for the current query between [start, end).
+    fn search_chunk(&mut self, start: usize, end: usize) -> Result<bool> {
         let mut found_results = false;
-
-        // Check if the query is a hex value
+        let query = self.search.query.clone();
         if let Some(hex_query) = query.strip_prefix("0x") {
             if let Ok(byte_value) = u8::from_str_radix(hex_query, 16) {
-                // Search for the byte value in this chunk
-                for i in start..end {
-                    if self.bytes[i] == byte_value {
-                        self.search.results.push(i);
+                for pos in start..end {
+                    let byte = self.get_byte_at(pos)?;
+                    if byte == byte_value {
+                        self.search.results.push(pos);
                         found_results = true;
                     }
                 }
             }
         } else {
-            // Search for ASCII string in this chunk
             let query_bytes = query.as_bytes();
             if !query_bytes.is_empty() {
-                for i in start..=end.saturating_sub(query_bytes.len()) {
-                    if i + query_bytes.len() <= self.bytes.len()
-                        && self.bytes[i..].starts_with(query_bytes)
-                    {
-                        self.search.results.push(i);
+                let qlen = query_bytes.len();
+                for pos in start..=end.saturating_sub(qlen) {
+                    let mut match_found = true;
+                    for j in 0..qlen {
+                        let b = self.get_byte_at(pos + j)?;
+                        if b != query_bytes[j] {
+                            match_found = false;
+                            break;
+                        }
+                    }
+                    if match_found {
+                        self.search.results.push(pos);
                         found_results = true;
                     }
                 }
             }
         }
-
-        found_results
+        Ok(found_results)
     }
 
     fn next_search_result(&mut self, visible_rows: usize) -> bool {
@@ -321,7 +365,7 @@ impl Hexide {
         }
     }
 
-    // UI helpers
+    // ----- UI Helpers -----
     fn truncate_path(&self, width: usize) -> String {
         self.filename
             .split('/')
@@ -344,37 +388,30 @@ impl Hexide {
         }
     }
 
-    // Main application loop
+    // ----- Main Application Loop -----
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(250);
-
         loop {
-            // Continue incremental search if in progress
             if self.search.search_in_progress {
-                self.continue_search();
+                self.continue_search()?;
             }
-
             terminal.draw(|f| self.ui(f))?;
-
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_default();
-
             if crossterm::event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         let terminal_size = terminal.size()?;
                         let visible_rows = terminal_size.height.saturating_sub(2) as usize;
                         let visible_width = terminal_size.width.saturating_sub(4) as usize;
-
                         if !self.handle_key_event(key.code, visible_rows, visible_width) {
                             return Ok(());
                         }
                     }
                 }
             }
-
             if last_tick.elapsed() >= tick_rate {
                 last_tick = Instant::now();
             }
@@ -469,7 +506,9 @@ impl Hexide {
                 KeyCode::Enter => {
                     let query_clone = query.clone();
                     if !query_clone.is_empty() {
-                        self.start_search(&query_clone);
+                        if let Err(e) = self.start_search(&query_clone, visible_rows) {
+                            eprintln!("Search error: {:?}", e);
+                        }
                         self.next_search_result(visible_rows);
                     }
                     self.mode = Mode::Normal;
@@ -486,12 +525,16 @@ impl Hexide {
         true
     }
 
-    // UI rendering
-    fn ui(&self, f: &mut Frame) {
+    // ----- UI Rendering -----
+    fn ui(&mut self, f: &mut Frame) {
         let area = f.area();
         let visible_rows = area.height.saturating_sub(2) as usize;
+        let visible_start = self.scroll_row * 16;
+        let visible_length = visible_rows * 16;
+        // Reload the cache so it always covers:
+        // [ visible_start - visible_length, visible_start + 2 * visible_length ]
+        let _ = self.ensure_cache_contains_visible_region(visible_start, visible_length);
 
-        // Create block and paragraph
         let block = Block::default()
             .title(format!(
                 " hexide - {} ",
@@ -499,13 +542,10 @@ impl Hexide {
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
-
         let paragraph = Paragraph::new(self.format_hex_dump(self.scroll_row, visible_rows))
             .block(block)
             .scroll((0, self.scroll_col as u16));
-
         f.render_widget(paragraph, area);
-
         self.render_scrollbar(f, area, visible_rows);
         self.render_status_bar(f, area);
     }
@@ -518,17 +558,14 @@ impl Hexide {
                 .symbols(symbols::scrollbar::VERTICAL)
                 .begin_symbol(None)
                 .end_symbol(None);
-
             let mut scrollbar_state = ScrollbarState::default()
                 .content_length(total_rows - visible_rows)
                 .position(self.scroll_row)
                 .viewport_content_length(visible_rows);
-
             let scrollbar_area = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
-
             let scrollbar_area = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -537,7 +574,6 @@ impl Hexide {
                     Constraint::Length(1),
                 ])
                 .split(scrollbar_area[1]);
-
             f.render_stateful_widget(vertical_scrollbar, scrollbar_area[1], &mut scrollbar_state);
         }
     }
@@ -553,15 +589,12 @@ impl Hexide {
             Mode::Offset(cmd) => format!(" Offset: {} ", cmd),
             Mode::Search(query) => format!(" Search: {} ", query),
         };
-
         let status_paragraph = Paragraph::new(Line::from(status_text).left_aligned())
             .style(Style::default().fg(Color::Gray));
-
         let status_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(area);
-
         let status_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -570,20 +603,18 @@ impl Hexide {
                 Constraint::Length(1),
             ])
             .split(status_layout[1]);
-
         f.render_widget(status_paragraph, status_layout[1]);
     }
 
-    fn format_hex_dump(&self, start_row: usize, visible_rows: usize) -> Text<'static> {
+    /// Generates the hex dump for visible rows.
+    fn format_hex_dump(&mut self, start_row: usize, visible_rows: usize) -> Text<'static> {
         let mut lines = Vec::with_capacity(visible_rows);
-
         for row in 0..visible_rows {
             let current_row = start_row + row;
-            let offset = current_row * 16;
-            if offset >= self.bytes.len() {
+            let file_offset = current_row * 16;
+            if file_offset >= self.total_file_size {
                 break;
             }
-
             let mut line_spans = Vec::new();
             let is_highlighted = current_row == self.cursor_row;
             let base_style = if is_highlighted {
@@ -591,12 +622,10 @@ impl Hexide {
             } else {
                 Style::default()
             };
-
-            // Add offset (adjusted for start_offset)
             line_spans.push(Span::styled(
                 format!(
                     " {:0fill$x}:  ",
-                    offset + self.start_offset,
+                    file_offset + self.start_offset,
                     fill = self.max_offset()
                 ),
                 if is_highlighted {
@@ -605,77 +634,65 @@ impl Hexide {
                     base_style.fg(Color::DarkGray)
                 },
             ));
-
-            // Add hex values
             for i in 0..16 {
-                let pos = offset + i;
-                if pos < self.bytes.len() {
+                let pos = file_offset + i;
+                if pos < self.total_file_size {
                     self.add_hex_byte(&mut line_spans, pos, base_style);
                 } else {
                     line_spans.push(Span::styled("   ", base_style));
                 }
-
-                // Add extra space in the middle
                 if i == 7 {
                     line_spans.push(Span::styled(" ", base_style));
                 }
             }
-
-            // Add ASCII representation
             line_spans.push(Span::styled(" │", base_style));
             for i in 0..16 {
-                let pos = offset + i;
-                if pos < self.bytes.len() {
+                let pos = file_offset + i;
+                if pos < self.total_file_size {
                     self.add_ascii_char(&mut line_spans, pos, base_style);
                 }
             }
             line_spans.push(Span::styled("│ ", base_style));
-
             lines.push(Line::from(line_spans));
         }
-
         Text::from(lines)
     }
 
-    fn add_hex_byte(&self, line_spans: &mut Vec<Span<'static>>, pos: usize, base_style: Style) {
-        let byte = self.bytes[pos];
+    fn add_hex_byte(&mut self, line_spans: &mut Vec<Span<'static>>, pos: usize, base_style: Style) {
+        let byte = self.get_byte_at(pos).unwrap_or(0);
         let mut byte_style = base_style.fg(self.get_byte_color(byte));
         let mut space_style = byte_style;
-
         let query_len = self.search.query_len();
-
-        // Highlight search results
         if self.search.is_match(pos, query_len) {
             byte_style = if self.search.is_current_match(pos, query_len) {
                 byte_style.bg(Color::Yellow).fg(Color::Black)
             } else {
                 byte_style.bg(Color::Rgb(0x45, 0x39, 0x35)).fg(Color::White)
             };
-
-            // Check if this is the last byte of a search result
-            if !self.search.is_match(pos + 1, query_len) {
-                space_style = base_style;
+            space_style = if !self.search.is_match(pos + 1, query_len) {
+                base_style
             } else {
-                space_style = byte_style;
-            }
+                byte_style
+            };
         }
-
         line_spans.push(Span::styled(format!("{:02x}", byte), byte_style));
         line_spans.push(Span::styled(" ", space_style));
     }
 
-    fn add_ascii_char(&self, line_spans: &mut Vec<Span<'static>>, pos: usize, base_style: Style) {
-        let byte = self.bytes[pos];
+    fn add_ascii_char(
+        &mut self,
+        line_spans: &mut Vec<Span<'static>>,
+        pos: usize,
+        base_style: Style,
+    ) {
+        let byte = self.get_byte_at(pos).unwrap_or(0);
         let c = if (32..=126).contains(&byte) {
             byte as char
         } else {
             '.'
         };
         let mut style = base_style.fg(self.get_byte_color(byte));
-
         let query_len = self.search.query_len();
-
-        // Highlight search results
         if self.search.is_match(pos, query_len) {
             style = if self.search.is_current_match(pos, query_len) {
                 style.bg(Color::Yellow).fg(Color::Black)
@@ -683,24 +700,19 @@ impl Hexide {
                 style.bg(Color::Rgb(0x45, 0x39, 0x35)).fg(Color::White)
             };
         }
-
         line_spans.push(Span::styled(c.to_string(), style));
     }
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-
     if args.len() < 2 {
         eprintln!("Usage: {} <filename> [-s offset] [-n bytes]", args[0]);
         std::process::exit(1);
     }
-
-    // Parse command line arguments
     let mut filename = None;
     let mut start_offset = 0;
-    let mut max_bytes = None;
-
+    let mut _max_bytes = None; // not used in this implementation
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -717,8 +729,9 @@ fn main() -> Result<()> {
                 }
             }
             "-n" => {
+                // We ignore -n since the cache size is computed from the visible area.
                 if i + 1 < args.len() {
-                    max_bytes = Some(args[i + 1].parse::<usize>().unwrap_or_else(|_| {
+                    _max_bytes = Some(args[i + 1].parse::<usize>().unwrap_or_else(|_| {
                         eprintln!("Invalid bytes value: {}", args[i + 1]);
                         std::process::exit(1);
                     }));
@@ -734,7 +747,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
     let filename = match filename {
         Some(name) => name,
         None => {
@@ -742,33 +754,23 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-
-    let mut app = Hexide::new(&filename, start_offset, max_bytes)?;
-
-    // Setup terminal
+    let mut app = Hexide::new(&filename, start_offset, _max_bytes)?;
     terminal::enable_raw_mode()?;
     panic::set_hook(Box::new(|info| {
         terminal::disable_raw_mode().ok();
         println!("Error: {:?}", info);
     }));
-
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
-
-    // Run app
     let res = app.run(&mut terminal);
-
-    // Restore terminal
     terminal.show_cursor()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
-
     if let Err(err) = res {
         println!("{:?}", err);
     }
-
     Ok(())
 }
