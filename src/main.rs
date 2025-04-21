@@ -2,6 +2,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::panic;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -134,7 +135,6 @@ impl SearchState {
 }
 
 struct Hexide {
-    // Fixed window cache based on the vision region
     cache: Vec<u8>,
     cache_start: usize, // file offset of cache[0]
     cache_end: usize,   // file offset immediately after cache
@@ -149,11 +149,6 @@ struct Hexide {
 }
 
 impl Hexide {
-    /// Opens the file and reads an initial cache covering:
-    /// [ (1 vision region before visible) | (visible region) | (1 vision region after visible) ].
-    ///
-    /// The initial visible region is determined by the terminal size later, so here we load a minimal
-    /// cache starting at start_offset. It will be reloaded when UI size is known.
     fn new(filename: &str, start_offset: usize, _max_bytes: Option<usize>) -> Result<Self> {
         let mut file = File::open(filename).context("Failed to open file")?;
         let metadata = file.metadata().context("Failed to get file metadata")?;
@@ -163,7 +158,6 @@ impl Hexide {
             return Err(anyhow::anyhow!("Start offset is beyond file size"));
         }
 
-        // Initially load a small cache window.
         let initial_cache_size = 256;
         let cache_end = (start_offset + initial_cache_size).min(file_size);
         let cache_size = cache_end - start_offset;
@@ -188,22 +182,18 @@ impl Hexide {
         })
     }
 
-    /// Returns the number of hex digits needed to represent the final offset.
     fn max_offset(&self) -> usize {
         format!("{:x}", self.start_offset + self.total_file_size)
             .len()
             .max(8)
     }
 
-    /// Rough content width calculation: offset field, hex bytes, ASCII representation,
-    /// surrounding spaces and borders.
     fn content_width(&self) -> usize {
         1 + self.max_offset() + 1 + 16 * 3 + 2 + 16 + 2 + 1
     }
 
-    /// Total rows in the file (each row is 16 bytes).
     fn total_rows(&self) -> usize {
-        self.total_file_size.div_ceil(16)
+        self.total_file_size.div_ceil(16) // round up division
     }
 
     fn max_vertical_scroll(&self, visible_rows: usize) -> usize {
@@ -211,15 +201,6 @@ impl Hexide {
         total.saturating_sub(visible_rows)
     }
 
-    // ----- Fixed-Size Cache with Vision Regions -----
-    ///
-    /// Given a visible region starting at `visible_start` (in bytes) with length `visible_length`
-    /// (in bytes), ensure the cache includes at least one full visible region before and one after.
-    ///
-    /// That is, reload the cache if needed to cover:
-    ///    desired_start = max(0, visible_start - visible_length)
-    ///    desired_end   = min(total_file_size, visible_start + (2 * visible_length))
-    ///
     fn ensure_cache_contains_visible_region(
         &mut self,
         visible_start: usize,
@@ -230,8 +211,6 @@ impl Hexide {
         if desired_end > self.total_file_size {
             desired_end = self.total_file_size;
         }
-
-        // Reload cache if the currently desired window is not fully contained.
         if desired_start < self.cache_start || desired_end > self.cache_end {
             let new_cache_size = desired_end - desired_start;
             let mut new_cache = vec![0u8; new_cache_size];
@@ -245,7 +224,6 @@ impl Hexide {
         Ok(())
     }
 
-    /// Returns a byte at a given file offset. If present in cache, return it; otherwise read directly.
     fn get_byte_at(&mut self, offset: usize) -> Result<u8> {
         if offset >= self.cache_start && offset < self.cache_end {
             Ok(self.cache[offset - self.cache_start])
@@ -276,7 +254,7 @@ impl Hexide {
 
     // ----- Search Functionality -----
     ///
-    /// Begins a search by first scanning the visible region.
+    /// Initiates a search (resets search state and scans the visible region once).
     fn start_search(&mut self, query: &str, visible_rows: usize) -> Result<()> {
         if query.is_empty() {
             return Ok(());
@@ -284,12 +262,12 @@ impl Hexide {
         self.search.reset(query);
         let visible_start = self.scroll_row * 16;
         let visible_end = (self.scroll_row + visible_rows) * 16;
-        self.search_chunk(visible_start, visible_end)?;
+        let _ = self.search_chunk(visible_start, visible_end)?;
         self.search.search_position = 0;
         Ok(())
     }
 
-    /// Continues an incremental search using fixed-size chunks.
+    /// Called repeatedly by the background search task.
     fn continue_search(&mut self) -> Result<bool> {
         if !self.search.search_in_progress {
             return Ok(false);
@@ -310,7 +288,6 @@ impl Hexide {
         Ok(found)
     }
 
-    /// Scans file bytes for the current query between [start, end).
     fn search_chunk(&mut self, start: usize, end: usize) -> Result<bool> {
         let mut found_results = false;
         let query = self.search.query.clone();
@@ -330,7 +307,7 @@ impl Hexide {
                 let qlen = query_bytes.len();
                 for pos in start..=end.saturating_sub(qlen) {
                     let mut match_found = true;
-                    for j in 0..qlen {
+                    for (j, _) in query_bytes.iter().enumerate().take(qlen) {
                         let b = self.get_byte_at(pos + j)?;
                         if b != query_bytes[j] {
                             match_found = false;
@@ -365,7 +342,7 @@ impl Hexide {
         }
     }
 
-    // ----- UI Helpers -----
+    // ----- UI Helpers & Rendering -----
     fn truncate_path(&self, width: usize) -> String {
         self.filename
             .split('/')
@@ -388,151 +365,11 @@ impl Hexide {
         }
     }
 
-    // ----- Main Application Loop -----
-    fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
-        let mut last_tick = Instant::now();
-        let tick_rate = Duration::from_millis(250);
-        loop {
-            if self.search.search_in_progress {
-                self.continue_search()?;
-            }
-            terminal.draw(|f| self.ui(f))?;
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_default();
-            if crossterm::event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        let terminal_size = terminal.size()?;
-                        let visible_rows = terminal_size.height.saturating_sub(2) as usize;
-                        let visible_width = terminal_size.width.saturating_sub(4) as usize;
-                        if !self.handle_key_event(key.code, visible_rows, visible_width) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            if last_tick.elapsed() >= tick_rate {
-                last_tick = Instant::now();
-            }
-        }
-    }
-
-    fn handle_key_event(
-        &mut self,
-        key: KeyCode,
-        visible_rows: usize,
-        visible_width: usize,
-    ) -> bool {
-        match &mut self.mode {
-            Mode::Normal => match key {
-                KeyCode::Char('q') => return false,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let max_line = self.total_rows().saturating_sub(1);
-                    self.cursor_row = self.cursor_row.saturating_add(1).min(max_line);
-                    self.ensure_cursor_visible(visible_rows);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.cursor_row = self.cursor_row.saturating_sub(1);
-                    self.ensure_cursor_visible(visible_rows);
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    let content_width = self.content_width();
-                    if content_width > visible_width {
-                        let max_scroll = content_width.saturating_sub(visible_width);
-                        self.scroll_col = self.scroll_col.saturating_add(1).min(max_scroll);
-                    }
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    self.scroll_col = self.scroll_col.saturating_sub(1);
-                }
-                KeyCode::PageDown => {
-                    let max_line = self.total_rows().saturating_sub(1);
-                    self.cursor_row = self.cursor_row.saturating_add(visible_rows).min(max_line);
-                    self.ensure_cursor_visible(visible_rows);
-                }
-                KeyCode::PageUp => {
-                    self.cursor_row = self.cursor_row.saturating_sub(visible_rows);
-                    self.ensure_cursor_visible(visible_rows);
-                }
-                KeyCode::Home => {
-                    self.cursor_row = 0;
-                    self.scroll_row = 0;
-                    self.scroll_col = 0;
-                }
-                KeyCode::End => {
-                    self.cursor_row = self.total_rows().saturating_sub(1);
-                    self.scroll_row = self.max_vertical_scroll(visible_rows);
-                }
-                KeyCode::Char(':') => {
-                    self.mode = Mode::Offset(String::new());
-                }
-                KeyCode::Char('/') => {
-                    self.mode = Mode::Search(String::new());
-                }
-                KeyCode::Char('n') => {
-                    self.next_search_result(visible_rows);
-                }
-                KeyCode::Char('N') => {
-                    self.prev_search_result(visible_rows);
-                }
-                _ => {}
-            },
-            Mode::Offset(cmd) => match key {
-                KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Enter => {
-                    if let Ok(offset) = cmd.trim().parse::<u64>() {
-                        let line = offset / 16;
-                        let max_line = self.total_rows().saturating_sub(1);
-                        self.cursor_row = (line as usize).min(max_line);
-                        self.ensure_cursor_visible(visible_rows);
-                    }
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Backspace => {
-                    cmd.pop();
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    cmd.push(c);
-                }
-                _ => {}
-            },
-            Mode::Search(query) => match key {
-                KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Enter => {
-                    let query_clone = query.clone();
-                    if !query_clone.is_empty() {
-                        if let Err(e) = self.start_search(&query_clone, visible_rows) {
-                            eprintln!("Search error: {:?}", e);
-                        }
-                        self.next_search_result(visible_rows);
-                    }
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                }
-                KeyCode::Char(c) => {
-                    query.push(c);
-                }
-                _ => {}
-            },
-        }
-        true
-    }
-
-    // ----- UI Rendering -----
     fn ui(&mut self, f: &mut Frame) {
         let area = f.area();
         let visible_rows = area.height.saturating_sub(2) as usize;
         let visible_start = self.scroll_row * 16;
         let visible_length = visible_rows * 16;
-        // Reload the cache so it always covers:
-        // [ visible_start - visible_length, visible_start + 2 * visible_length ]
         let _ = self.ensure_cache_contains_visible_region(visible_start, visible_length);
 
         let block = Block::default()
@@ -580,12 +417,10 @@ impl Hexide {
 
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
         let status_text = match &self.mode {
-            Mode::Normal => {
-                format!(
-                    " j/k: ↑/↓ | h/l: ←/→ | :: Offset | /: Search{} | q: Quit ",
-                    self.search.status_text()
-                )
-            }
+            Mode::Normal => format!(
+                " j/k: ↑/↓ | h/l: ←/→ | :: Offset | /: Search{} | q: Quit ",
+                self.search.status_text()
+            ),
             Mode::Offset(cmd) => format!(" Offset: {} ", cmd),
             Mode::Search(query) => format!(" Search: {} ", query),
         };
@@ -606,7 +441,6 @@ impl Hexide {
         f.render_widget(status_paragraph, status_layout[1]);
     }
 
-    /// Generates the hex dump for visible rows.
     fn format_hex_dump(&mut self, start_row: usize, visible_rows: usize) -> Text<'static> {
         let mut lines = Vec::with_capacity(visible_rows);
         for row in 0..visible_rows {
@@ -702,9 +536,176 @@ impl Hexide {
         }
         line_spans.push(Span::styled(c.to_string(), style));
     }
+
+    // ----- Main Application Loop -----
+    fn run(
+        &mut self,
+        terminal: &mut Terminal<impl Backend>,
+        app_arc: Arc<Mutex<Hexide>>,
+    ) -> Result<()> {
+        let mut last_tick = Instant::now();
+        let tick_rate = Duration::from_millis(250);
+        loop {
+            terminal.draw(|f| self.ui(f))?;
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_default();
+            if crossterm::event::poll(timeout)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        let terminal_size = terminal.size()?;
+                        let visible_rows = terminal_size.height.saturating_sub(2) as usize;
+                        let visible_width = terminal_size.width.saturating_sub(4) as usize;
+                        if !self.handle_key_event(
+                            key.code,
+                            visible_rows,
+                            visible_width,
+                            app_arc.clone(),
+                        ) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if last_tick.elapsed() >= tick_rate {
+                last_tick = Instant::now();
+            }
+        }
+    }
+
+    // Updated handle_key_event with an Arc clone passed for background search.
+    fn handle_key_event(
+        &mut self,
+        key: KeyCode,
+        visible_rows: usize,
+        visible_width: usize,
+        app_arc: Arc<Mutex<Hexide>>,
+    ) -> bool {
+        match &mut self.mode {
+            Mode::Normal => match key {
+                KeyCode::Char('q') => return false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max_line = self.total_rows().saturating_sub(1);
+                    self.cursor_row = self.cursor_row.saturating_add(1).min(max_line);
+                    self.ensure_cursor_visible(visible_rows);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.cursor_row = self.cursor_row.saturating_sub(1);
+                    self.ensure_cursor_visible(visible_rows);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let content_width = self.content_width();
+                    if content_width > visible_width {
+                        let max_scroll = content_width.saturating_sub(visible_width);
+                        self.scroll_col = self.scroll_col.saturating_add(1).min(max_scroll);
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.scroll_col = self.scroll_col.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    let max_line = self.total_rows().saturating_sub(1);
+                    self.cursor_row = self.cursor_row.saturating_add(visible_rows).min(max_line);
+                    self.ensure_cursor_visible(visible_rows);
+                }
+                KeyCode::PageUp => {
+                    self.cursor_row = self.cursor_row.saturating_sub(visible_rows);
+                    self.ensure_cursor_visible(visible_rows);
+                }
+                KeyCode::Home => {
+                    self.cursor_row = 0;
+                    self.scroll_row = 0;
+                    self.scroll_col = 0;
+                }
+                KeyCode::End => {
+                    self.cursor_row = self.total_rows().saturating_sub(1);
+                    self.scroll_row = self.max_vertical_scroll(visible_rows);
+                }
+                KeyCode::Char(':') => {
+                    self.mode = Mode::Offset(String::new());
+                }
+                KeyCode::Char('/') => {
+                    self.mode = Mode::Search(String::new());
+                }
+                KeyCode::Char('n') => {
+                    self.next_search_result(visible_rows);
+                }
+                KeyCode::Char('N') => {
+                    self.prev_search_result(visible_rows);
+                }
+                _ => {}
+            },
+            Mode::Offset(cmd) => match key {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Enter => {
+                    if let Ok(offset) = cmd.trim().parse::<u64>() {
+                        let line = offset / 16;
+                        let max_line = self.total_rows().saturating_sub(1);
+                        self.cursor_row = (line as usize).min(max_line);
+                        self.ensure_cursor_visible(visible_rows);
+                    }
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    cmd.pop();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    cmd.push(c);
+                }
+                _ => {}
+            },
+            Mode::Search(query) => match key {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Enter => {
+                    let query_clone = query.clone();
+                    if !query_clone.is_empty() {
+                        if let Err(e) = self.start_search(&query_clone, visible_rows) {
+                            eprintln!("Search error: {:?}", e);
+                        }
+                        // Spawn a background search task using the shared app_arc.
+                        let app_for_search = app_arc.clone();
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                loop {
+                                    // Lock the app and run a search chunk.
+                                    let mut app = app_for_search.lock().unwrap();
+                                    match app.continue_search() {
+                                        Ok(false) => break,
+                                        Ok(true) => { /* continue searching */ }
+                                        Err(e) => {
+                                            eprintln!("Error during background search: {:?}", e);
+                                            break;
+                                        }
+                                    }
+                                    // Small sleep to yield time.
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                            })
+                            .await
+                            .unwrap();
+                        });
+                    }
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                }
+                _ => {}
+            },
+        }
+        true
+    }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <filename> [-s offset] [-n bytes]", args[0]);
@@ -712,7 +713,7 @@ fn main() -> Result<()> {
     }
     let mut filename = None;
     let mut start_offset = 0;
-    let mut _max_bytes = None; // not used in this implementation
+    let mut _max_bytes = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -729,7 +730,6 @@ fn main() -> Result<()> {
                 }
             }
             "-n" => {
-                // We ignore -n since the cache size is computed from the visible area.
                 if i + 1 < args.len() {
                     _max_bytes = Some(args[i + 1].parse::<usize>().unwrap_or_else(|_| {
                         eprintln!("Invalid bytes value: {}", args[i + 1]);
@@ -754,10 +754,14 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let mut app = Hexide::new(&filename, start_offset, _max_bytes)?;
+
+    let app = Hexide::new(&filename, start_offset, _max_bytes)?;
+    // Wrap our app in Arc<Mutex<>> so that it can be shared safely.
+    let app_arc = Arc::new(Mutex::new(app));
+
     terminal::enable_raw_mode()?;
     panic::set_hook(Box::new(|info| {
-        terminal::disable_raw_mode().ok();
+        let _ = terminal::disable_raw_mode();
         println!("Error: {:?}", info);
     }));
     let stdout = io::stdout();
@@ -765,12 +769,15 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
-    let res = app.run(&mut terminal);
+
+    {
+        // We use a scoped lock to obtain mutable reference to run our UI.
+        let mut app = app_arc.lock().unwrap();
+        app.run(&mut terminal, app_arc.clone())?;
+    }
+
     terminal.show_cursor()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
-    if let Err(err) = res {
-        println!("{:?}", err);
-    }
     Ok(())
 }
