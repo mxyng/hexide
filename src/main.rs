@@ -1,7 +1,6 @@
 use std::env;
 use std::fs::File;
-use std::io::Seek;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::panic;
 use std::time::{Duration, Instant};
 
@@ -158,7 +157,7 @@ impl Hexide {
         if start_offset as u64 >= metadata.len() {
             return Err(anyhow::anyhow!("Start offset is beyond file size"));
         } else if start_offset > 0 {
-            file.seek(std::io::SeekFrom::Start(start_offset as u64))
+            file.seek(SeekFrom::Start(start_offset as u64))
                 .context("Failed to seek in file")?;
         }
 
